@@ -89,10 +89,29 @@ def accept_cookies(page):
         pass
 
 
+def block_heavy(route):
+    # Images, fonts and videos aren't needed to read the table – skip them
+    if route.request.resource_type in ("image", "media", "font"):
+        return route.abort()
+    return route.continue_()
+
+
+def new_page(browser):
+    ctx = browser.new_context(locale="de-DE")
+    ctx.route("**/*", block_heavy)
+    return ctx.new_page()
+
+
 def page_lines(page):
-    page.goto(URL, wait_until="networkidle", timeout=60000)
+    # Don't wait for the whole page (trackers can keep it "busy" forever);
+    # just wait until the listing table has rendered.
+    page.goto(URL, wait_until="domcontentloaded", timeout=45000)
     accept_cookies(page)
-    page.wait_for_timeout(3000)  # give the listing widget time to render
+    try:
+        page.get_by_text(re.compile(r"^\s*Vorname", re.I)).first.wait_for(timeout=30000)
+    except Exception:
+        pass  # parse_entries() reports it if the table really is missing
+    page.wait_for_timeout(1500)  # let the remaining rows fill in
     lines = []
     for frame in page.frames:
         try:
@@ -154,7 +173,7 @@ def main():
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        page = browser.new_context(locale="de-DE").new_page()
+        page = new_page(browser)
 
         if args.dump:
             lines = page_lines(page)
@@ -197,10 +216,23 @@ def main():
                 previous = current
             except Exception as e:
                 failures += 1
-                log(f"Check failed ({failures}): {e}")
-                if failures == 5:
+                reason = str(e).splitlines()[0] if str(e) else type(e).__name__
+                log(f"Check failed ({failures}), retrying soon: {reason}")
+                if failures == 10:
                     notify("Boerse watcher has problems",
-                           f"5 checks in a row failed: {e}", priority="default")
+                           f"10 checks in a row failed: {reason}", priority="default")
+                # start with a fresh browser tab in case the old one got stuck
+                try:
+                    page.context.close()
+                except Exception:
+                    pass
+                try:
+                    page = new_page(browser)
+                except Exception:
+                    browser = p.chromium.launch(headless=True)
+                    page = new_page(browser)
+                time.sleep(15)  # retry quickly instead of waiting a full minute
+                continue
             time.sleep(INTERVAL + random.uniform(0, 10))
 
 
